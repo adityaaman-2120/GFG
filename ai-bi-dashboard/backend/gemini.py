@@ -184,8 +184,9 @@ def apply_follow_up_to_sql(
     region_value = _extract_region_value(question)
     payment_method = _extract_payment_method(question)
     new_limit = _extract_limit(question)
+    generic_conditions = _extract_follow_up_conditions(question, effective_allowed)
 
-    if not region_value and not payment_method and new_limit is None:
+    if not region_value and not payment_method and new_limit is None and not generic_conditions:
         raise ValueError("Unsupported follow-up request.")
 
     updated_query = compact_query
@@ -207,6 +208,10 @@ def apply_follow_up_to_sql(
         updated_query = _append_condition(updated_query, condition)
         applied_change = True
 
+    for condition in generic_conditions:
+        updated_query = _append_condition(updated_query, condition)
+        applied_change = True
+
     if new_limit is not None:
         updated_query = _replace_or_append_limit(updated_query, new_limit)
         applied_change = True
@@ -219,6 +224,36 @@ def apply_follow_up_to_sql(
         table_name=table_name,
         allowed_columns=effective_allowed,
     )
+
+
+def _extract_follow_up_conditions(question: str, allowed_columns: set[str]) -> list[str]:
+    conditions: list[str] = []
+    for column in sorted(allowed_columns):
+        variants = (column.lower(), column.lower().replace("_", " "))
+        pattern_prefix = "(?:" + "|".join(re.escape(variant) for variant in variants) + ")"
+
+        number_pattern = re.compile(
+            pattern_prefix + r"\s*(?:=|is|equals|equal to)\s*(-?\d+(?:\.\d+)?)",
+            re.IGNORECASE,
+        )
+        text_pattern = re.compile(
+            pattern_prefix + r"\s*(?:=|is|equals|equal to|as|like)\s*['\"]?([a-z0-9_ .\-]+)['\"]?",
+            re.IGNORECASE,
+        )
+
+        number_match = number_pattern.search(question)
+        if number_match:
+            conditions.append(f"{column} = {number_match.group(1)}")
+            continue
+
+        text_match = text_pattern.search(question)
+        if text_match:
+            raw_value = text_match.group(1).strip()
+            if raw_value:
+                safe_value = raw_value.replace("'", "''")
+                conditions.append(f"{column} = '{safe_value}'")
+
+    return conditions
 
 
 def validate_sql_query(
@@ -879,7 +914,7 @@ def _generate_with_generic_rules(
 ) -> str:
     lowered = question.lower()
     padded = f" {lowered} "
-    limit = _extract_limit(question) or 20
+    explicit_limit = _extract_limit(question)
     columns = list(allowed_columns.keys())
     numeric_columns = [
         name for name, dtype in allowed_columns.items()
@@ -891,12 +926,16 @@ def _generate_with_generic_rules(
         for name in columns
         if "date" in name or "time" in name or "month" in name or "year" in name
     ]
+    inferred_filters = _extract_generic_filters(question, allowed_columns)
 
     if not columns:
         return "NOT_POSSIBLE"
 
     if "count" in lowered or "how many" in lowered:
-        return f"SELECT COUNT(*) AS total_rows FROM {table_name}"
+        base_sql = f"SELECT COUNT(*) AS total_rows FROM {table_name}"
+        if inferred_filters:
+            base_sql = _append_where_clause(base_sql, inferred_filters)
+        return base_sql
 
     metric_column = _best_matching_column(lowered, numeric_columns)
     group_column = _best_matching_column(lowered, columns)
@@ -943,43 +982,138 @@ def _generate_with_generic_rules(
     # Trend/time style questions.
     if metric_column and date_columns and any(token in lowered for token in ("trend", "over time", "daily", "monthly", "time")):
         date_col = group_column if group_column in date_columns else date_columns[0]
-        return (
+        sql = (
             f"SELECT {date_col}, ROUND(SUM({metric_column}), 2) AS total_{metric_column} "
-            f"FROM {table_name} GROUP BY {date_col} ORDER BY {date_col} ASC LIMIT {limit}"
+            f"FROM {table_name} GROUP BY {date_col} ORDER BY {date_col} ASC"
         )
+        sql = _append_where_clause(sql, inferred_filters)
+        if explicit_limit is not None:
+            sql = f"{sql} LIMIT {explicit_limit}"
+        return sql
 
     if metric_column and ("average" in lowered or "avg" in lowered):
         if group_column and group_column != metric_column and (" by " in padded or " per " in padded):
-            return (
+            sql = (
                 f"SELECT {group_column}, ROUND(AVG({metric_column}), 2) AS average_{metric_column} "
-                f"FROM {table_name} GROUP BY {group_column} ORDER BY average_{metric_column} DESC LIMIT {limit}"
+                f"FROM {table_name} GROUP BY {group_column} ORDER BY average_{metric_column} DESC"
             )
-        return f"SELECT ROUND(AVG({metric_column}), 2) AS average_{metric_column} FROM {table_name}"
+            sql = _append_where_clause(sql, inferred_filters)
+            if explicit_limit is not None:
+                sql = f"{sql} LIMIT {explicit_limit}"
+            return sql
+        sql = f"SELECT ROUND(AVG({metric_column}), 2) AS average_{metric_column} FROM {table_name}"
+        sql = _append_where_clause(sql, inferred_filters)
+        return sql
 
     if metric_column and ("sum" in lowered or "total" in lowered):
         if group_column and group_column != metric_column and (" by " in padded or " per " in padded):
-            return (
+            sql = (
                 f"SELECT {group_column}, ROUND(SUM({metric_column}), 2) AS total_{metric_column} "
-                f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC LIMIT {limit}"
+                f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC"
             )
-        return f"SELECT ROUND(SUM({metric_column}), 2) AS total_{metric_column} FROM {table_name}"
+            sql = _append_where_clause(sql, inferred_filters)
+            if explicit_limit is not None:
+                sql = f"{sql} LIMIT {explicit_limit}"
+            return sql
+        sql = f"SELECT ROUND(SUM({metric_column}), 2) AS total_{metric_column} FROM {table_name}"
+        sql = _append_where_clause(sql, inferred_filters)
+        return sql
 
     if group_column and metric_column and (" by " in padded or " per " in padded):
-        return (
+        sql = (
             f"SELECT {group_column}, ROUND(SUM({metric_column}), 2) AS total_{metric_column} "
-            f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC LIMIT {limit}"
+            f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC"
         )
+        sql = _append_where_clause(sql, inferred_filters)
+        if explicit_limit is not None:
+            sql = f"{sql} LIMIT {explicit_limit}"
+        return sql
 
     if metric_column and "top" in lowered and group_column and group_column != metric_column:
-        return (
+        top_limit = explicit_limit if explicit_limit is not None else 10
+        sql = (
             f"SELECT {group_column}, ROUND(SUM({metric_column}), 2) AS total_{metric_column} "
-            f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC LIMIT {limit}"
+            f"FROM {table_name} GROUP BY {group_column} ORDER BY total_{metric_column} DESC LIMIT {top_limit}"
         )
+        sql = _append_where_clause(sql, inferred_filters)
+        return sql
 
     if any(token in lowered for token in ("show", "list", "preview", "sample", "data")):
-        return f"SELECT * FROM {table_name} LIMIT {limit}"
+        preview_limit = explicit_limit if explicit_limit is not None else 50
+        sql = f"SELECT * FROM {table_name}"
+        sql = _append_where_clause(sql, inferred_filters)
+        return f"{sql} LIMIT {preview_limit}"
 
-    return f"SELECT * FROM {table_name} LIMIT {limit}"
+    sql = f"SELECT * FROM {table_name}"
+    sql = _append_where_clause(sql, inferred_filters)
+    if explicit_limit is not None:
+        sql = f"{sql} LIMIT {explicit_limit}"
+    return sql
+
+
+def _extract_generic_filters(question: str, allowed_columns: dict[str, str]) -> list[str]:
+    lowered = question.lower()
+    has_filter_intent = any(token in lowered for token in ("filter", "where", "only", "with", "equals", "is"))
+    if not has_filter_intent:
+        return []
+
+    conditions: list[str] = []
+    for column, dtype in allowed_columns.items():
+        column_variants = {column.lower(), column.lower().replace("_", " ")}
+        pattern_prefix = "(?:" + "|".join(re.escape(variant) for variant in column_variants) + ")"
+
+        string_pattern = re.compile(
+            pattern_prefix + r"\s*(?:=|is|equals|equal to|as|like)\s*['\"]?([a-z0-9_ .\-]+)['\"]?",
+            re.IGNORECASE,
+        )
+        number_pattern = re.compile(
+            pattern_prefix + r"\s*(?:=|is|equals|equal to)\s*(-?\d+(?:\.\d+)?)",
+            re.IGNORECASE,
+        )
+
+        if any(token in (dtype or "").upper() for token in ("INT", "REAL", "NUM", "DEC", "FLOAT", "DOUBLE")):
+            match = number_pattern.search(question)
+            if match:
+                conditions.append(f"{column} = {match.group(1)}")
+                continue
+
+        match = string_pattern.search(question)
+        if match:
+            raw_value = match.group(1).strip()
+            if raw_value:
+                safe_value = raw_value.replace("'", "''")
+                conditions.append(f"{column} = '{safe_value}'")
+
+    return conditions
+
+
+def _append_where_clause(sql_query: str, conditions: list[str]) -> str:
+    if not conditions:
+        return sql_query
+
+    lowered = sql_query.lower()
+    clause_positions = [
+        index
+        for index in (
+            lowered.find(" group by "),
+            lowered.find(" order by "),
+            lowered.find(" limit "),
+            lowered.find(" having "),
+        )
+        if index != -1
+    ]
+
+    condition_sql = " AND ".join(conditions)
+    where_index = lowered.find(" where ")
+    if where_index != -1:
+        end_index = min([index for index in clause_positions if index > where_index], default=len(sql_query))
+        return f"{sql_query[:end_index]} AND {condition_sql}{sql_query[end_index:]}"
+
+    insert_at = min(clause_positions, default=len(sql_query))
+    prefix = sql_query[:insert_at].rstrip()
+    suffix = sql_query[insert_at:]
+    spacer = " " if suffix and not suffix.startswith(" ") else ""
+    return f"{prefix} WHERE {condition_sql}{spacer}{suffix}"
 
 
 def _best_matching_column(question_lower: str, candidates: list[str]) -> str | None:

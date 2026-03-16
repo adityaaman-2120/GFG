@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Bar, Line, Pie, Scatter } from "react-chartjs-2";
 import {
   type ChartData,
@@ -62,6 +62,13 @@ const darkLegend = {
 interface ChartProps {
   data: Record<string, unknown>[];
   chartType: string;
+  externalControls?: {
+    metric?: string;
+    search?: string;
+    topN?: number;
+    sortOrder?: SortOrder;
+    revision?: number;
+  };
 }
 
 type SortOrder = "none" | "desc" | "asc";
@@ -238,7 +245,7 @@ function getColumns(row: Record<string, unknown>) {
   return { labelKey, valueKey };
 }
 
-export default function DashboardChart({ data, chartType }: ChartProps) {
+export default function DashboardChart({ data, chartType, externalControls }: ChartProps) {
   const firstRow = data[0] ?? {};
   const labelKey = Object.keys(firstRow)[0] ?? "label";
   const numericColumns = Object.keys(firstRow).filter((key) =>
@@ -251,6 +258,29 @@ export default function DashboardChart({ data, chartType }: ChartProps) {
   const [sortOrder, setSortOrder] = useState<SortOrder>("none");
   const [zoomLevel, setZoomLevel] = useState(1);
   const [offset, setOffset] = useState(0);
+
+  useEffect(() => {
+    if (!externalControls?.revision) {
+      return;
+    }
+    if (externalControls.metric && numericColumns.includes(externalControls.metric)) {
+      setActiveMetric(externalControls.metric);
+    }
+    if (typeof externalControls.search === "string") {
+      setSearch(externalControls.search);
+    }
+    if (typeof externalControls.topN === "number" && Number.isFinite(externalControls.topN)) {
+      setTopN(Math.max(1, Math.min(1000, Math.floor(externalControls.topN))));
+    }
+    if (
+      externalControls.sortOrder &&
+      ["none", "asc", "desc"].includes(externalControls.sortOrder)
+    ) {
+      setSortOrder(externalControls.sortOrder);
+    }
+    setZoomLevel(1);
+    setOffset(0);
+  }, [externalControls, numericColumns]);
 
   const commonOptions = useMemo(
     () => ({

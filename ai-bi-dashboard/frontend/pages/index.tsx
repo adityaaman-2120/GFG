@@ -26,6 +26,25 @@ const CHART_META: Record<string, { icon: string; label: string }> = {
   table:   { icon: "📋", label: "Data Table" },
 };
 
+type ChartSortOrder = "none" | "asc" | "desc";
+
+type ChartControlPatch = {
+  metric?: string;
+  search?: string;
+  topN?: number;
+  sortOrder?: ChartSortOrder;
+};
+
+type ChartControlsState = {
+  metric: string;
+  search: string;
+  topN: number;
+  sortOrder: ChartSortOrder;
+  revision: number;
+};
+
+type ApplyChartControlPatch = (patch: ChartControlPatch) => void;
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -47,6 +66,13 @@ export default function Home() {
   const [datasetLabel, setDatasetLabel] = useState("Amazon Sales · 50 k rows");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState("default");
+  const [chartControls, setChartControls] = useState<ChartControlsState>({
+    metric: "",
+    search: "",
+    topN: 20,
+    sortOrder: "none",
+    revision: 0,
+  });
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -82,6 +108,27 @@ export default function Home() {
     const query = (q ?? question).trim();
     if (!query) return;
 
+    const appliedChartControl = tryApplyChatChartCommand(
+      query,
+      result?.data ?? [],
+      applyChartControlPatch
+    );
+    if (appliedChartControl.applied) {
+      const assistantAck: ChatMessage = {
+        id: `a_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        role: "assistant",
+        text: appliedChartControl.message,
+      };
+      const userMessageForControl: ChatMessage = {
+        id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        role: "user",
+        text: query,
+      };
+      setChatMessages((previous) => [...previous, userMessageForControl, assistantAck]);
+      setQuestion("");
+      return;
+    }
+
     const userMessage: ChatMessage = {
       id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       role: "user",
@@ -97,6 +144,14 @@ export default function Home() {
       const response = await askDashboard(query, sessionId);
       setResult(response);
       setQuestion(query);
+      setChartControls((previous) => ({
+        ...previous,
+        metric: "",
+        search: "",
+        topN: 20,
+        sortOrder: "none",
+        revision: previous.revision + 1,
+      }));
 
       const assistantText = response.message?.trim()
         ? response.message
@@ -163,6 +218,16 @@ export default function Home() {
         fileInputRef.current.value = "";
       }
     }
+  }
+
+  function applyChartControlPatch(patch: ChartControlPatch) {
+    setChartControls((previous) => ({
+      metric: patch.metric ?? previous.metric,
+      search: patch.search ?? previous.search,
+      topN: patch.topN ?? previous.topN,
+      sortOrder: patch.sortOrder ?? previous.sortOrder,
+      revision: previous.revision + 1,
+    }));
   }
 
   return (
@@ -313,7 +378,12 @@ export default function Home() {
               </div>
               {/* Chart body */}
               <div className="p-5 pt-6">
-                <DashboardChart data={result.data} chartType={result.chart_type} />
+                <DashboardChart
+                  key={`${result.chart_type}:${result.sql_query}`}
+                  data={result.data}
+                  chartType={result.chart_type}
+                  externalControls={chartControls}
+                />
               </div>
             </div>
 
@@ -405,4 +475,67 @@ export default function Home() {
       </main>
     </div>
   );
+}
+
+function tryApplyChatChartCommand(
+  rawCommand: string,
+  rows: Record<string, unknown>[],
+  applyChartControlPatch: ApplyChartControlPatch
+): { applied: boolean; message: string } {
+  if (!rows.length) {
+    return { applied: false, message: "" };
+  }
+
+  const normalized = rawCommand.trim().toLowerCase();
+  const columns = Object.keys(rows[0]);
+  const numericColumns = columns.filter((column) =>
+    rows.some((row) => typeof row[column] === "number")
+  );
+
+  const metricMatch = normalized.match(
+    /(?:change|set|switch)\s+(?:the\s+)?metric(?:\s+from\s+[a-z0-9_ ]+)?\s+(?:to|as)\s+([a-z0-9_ ]+)/i
+  );
+  if (metricMatch) {
+    const desired = metricMatch[1].trim().replace(/\s+/g, "_");
+    const metric = numericColumns.find(
+      (column) => column.toLowerCase() === desired.toLowerCase()
+    );
+    if (!metric) {
+      return {
+        applied: true,
+        message: `I could not find that metric. Available metrics: ${numericColumns.join(", ")}`,
+      };
+    }
+    applyChartControlPatch({ metric });
+    return { applied: true, message: `Updated metric to ${metric}.` };
+  }
+
+  const topMatch = normalized.match(/(?:top|limit)\s+(\d{1,4})/i);
+  if (topMatch) {
+    const topN = Math.max(1, Math.min(1000, Number(topMatch[1])));
+    applyChartControlPatch({ topN });
+    return { applied: true, message: `Showing top ${topN} rows in the chart.` };
+  }
+
+  if (/(?:sort|order).*(high to low|descending|desc)/i.test(normalized)) {
+    applyChartControlPatch({ sortOrder: "desc" });
+    return { applied: true, message: "Sorted chart values from high to low." };
+  }
+  if (/(?:sort|order).*(low to high|ascending|asc)/i.test(normalized)) {
+    applyChartControlPatch({ sortOrder: "asc" });
+    return { applied: true, message: "Sorted chart values from low to high." };
+  }
+  if (/(?:reset|clear).*(sort|order)/i.test(normalized)) {
+    applyChartControlPatch({ sortOrder: "none" });
+    return { applied: true, message: "Reset chart sorting to original order." };
+  }
+
+  const searchMatch = normalized.match(/(?:filter|search).*(?:for|to|as)\s+([a-z0-9_ .-]+)/i);
+  if (searchMatch) {
+    const search = searchMatch[1].trim();
+    applyChartControlPatch({ search });
+    return { applied: true, message: `Applied chart label filter: ${search}.` };
+  }
+
+  return { applied: false, message: "" };
 }

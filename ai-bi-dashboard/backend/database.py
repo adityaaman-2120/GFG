@@ -121,7 +121,7 @@ Columns:
 Rules:
 - Only generate a single SQLite SELECT query.
 - Use the {active_table} table only.
-- Prefer aggregates and LIMIT 20 for grouped results unless the user asks for a full export.
+- Do not add LIMIT unless the user explicitly asks for top/limit/sample/preview rows.
 - When the question asks for ranking, sort descending on the relevant metric.
 """.strip()
 
